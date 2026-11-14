@@ -35,7 +35,7 @@
       </div>
       <div class="table-wrap roomy">
         <table class="dense" id="history-table">
-          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单</th></tr></thead>
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>规则版本</th><th>状态</th><th>工单</th></tr></thead>
           <tbody>
             {% for item in history %}
             <tr>
@@ -45,18 +45,23 @@
               <td>{{ item.rows or '—' }}</td>
               <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
               <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if item.basis_version %}
+                <span class="tag {% if item.basis_version == current_version %}ok{% else %}warn{% endif %}">v{{ item.basis_version }}</span>
+                {% else %}—{% endif %}
+              </td>
               <td class="small">{{ item.stage }}</td>
               <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">下载 CSV</a>{% else %}—{% endif %}</td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="muted">暂无运行记录。去 <a href="/workbench">工作台</a> 执行一次抽检。</td></tr>
+            <tr><td colspan="9" class="muted">暂无运行记录。去 <a href="/workbench">工作台</a> 执行一次抽检。</td></tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
       <div class="panel-actions">
         <span class="small muted" style="align-self:center">
-          历史按时间倒序；「工单」列的 CSV 使用该次运行自己的报告快照，重算后同一 run_id 的工单会跟着更新。
+          历史按时间倒序；规则版本为当前整改依据（黄色 = 非当前版本，可到工作台发起批量重评）。「工单」列的 CSV 使用该次运行依据版本的报告快照。
         </span>
       </div>
     </section>

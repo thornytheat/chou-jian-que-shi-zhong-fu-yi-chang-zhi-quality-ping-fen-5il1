@@ -191,7 +191,7 @@
       </div>
       <div class="table-wrap roomy">
         <table class="dense">
-          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单</th></tr></thead>
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>规则版本</th><th>状态</th><th>工单</th></tr></thead>
           <tbody>
             {% for item in history %}
             <tr>
@@ -201,11 +201,16 @@
               <td>{{ item.rows or '—' }}</td>
               <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
               <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if item.basis_version %}
+                <span class="tag {% if item.basis_version == current_version %}ok{% else %}warn{% endif %}">v{{ item.basis_version }}</span>
+                {% else %}—{% endif %}
+              </td>
               <td class="small">{{ item.stage }}</td>
               <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">CSV</a>{% else %}—{% endif %}</td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="muted">还没有运行记录。点右上角「立即抽检样例」或去 <a href="/workbench">工作台</a> 执行一次。</td></tr>
+            <tr><td colspan="9" class="muted">还没有运行记录。点右上角「立即抽检样例」或去 <a href="/workbench">工作台</a> 执行一次。</td></tr>
             {% endfor %}
           </tbody>
         </table>

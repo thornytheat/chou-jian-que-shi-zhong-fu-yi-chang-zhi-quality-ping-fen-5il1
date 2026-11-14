@@ -109,6 +109,91 @@
       </div>
     </div>
 
+    <section class="panel" id="reeval"{% if campaign and campaign.status == 'running' %} data-running="{{ campaign.campaign_id }}"{% endif %}>
+      <div class="panel-head">
+        <h2>规则版本与批量重评</h2>
+        <div class="panel-actions">
+          {% if eligible_count %}<span class="tag warn">{{ eligible_count }} 批待重评</span>
+          {% else %}<span class="tag ok">全部批次为当前版本</span>{% endif %}
+        </div>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0 0 8px">
+          当前规则版本 <strong>v{{ current_version }}</strong>。规则调整后，历史批次仍按旧版本计分：
+          发起批量重评会为每个批次生成<strong>独立重评记录</strong>（旧分数与旧工单继续可查），
+          <strong>全部批次成功后整批切换整改依据</strong>；中途失败不混用新旧依据，可从断点续跑，
+          同一批重试不会产生重复记录。
+        </p>
+        <div class="table-wrap auto">
+          <table class="dense">
+            <thead><tr><th>规则版本</th><th>登记时间</th><th>说明</th><th>状态</th></tr></thead>
+            <tbody>
+              {% for v in rule_versions %}
+              <tr>
+                <td><code>v{{ v.version }}</code></td>
+                <td class="small muted nowrap">{{ v.created_at }}</td>
+                <td class="small">{{ v.note or '—' }}</td>
+                <td>{% if v.version == current_version %}<span class="tag ok">当前</span>{% else %}<span class="tag">历史</span>{% endif %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        {% if campaign %}
+        <div style="margin-top:10px">
+          <p class="small" style="margin:0 0 6px">
+            最近重评批次 <code>{{ campaign.campaign_id }}</code> · 目标版本 <strong>v{{ campaign.to_version }}</strong> ·
+            {% if campaign.status == 'done' %}<span class="tag ok">已完成</span>
+            {% elif campaign.status == 'failed' %}<span class="tag err">失败 · 可断点续跑</span>
+            {% else %}<span class="tag warn">进行中</span>{% endif %}
+            <span id="reeval-progress-text">进度 {{ campaign.done_count }}/{{ campaign.total }}</span>
+          </p>
+          <div class="progress">
+            <div class="progress-bar" id="reeval-progress-bar"
+                 style="width:{% if campaign.total %}{{ (campaign.done_count / campaign.total * 100)|round(0, 'floor')|int }}{% else %}0{% endif %}%"></div>
+          </div>
+          {% if campaign.status == 'failed' %}
+          <p class="small" style="margin:6px 0 0">
+            断点：批次 <code>{{ campaign.failed_run_id }}</code> — {{ campaign.error }}<br>
+            已完成的 {{ campaign.done_count }} 批保留重评记录；<strong>所有批次的整改依据仍全部是旧版本，未发生混用</strong>。
+          </p>
+          {% elif campaign.status == 'done' %}
+          <p class="small muted" style="margin:6px 0 0">
+            {{ campaign.total }} 批全部重评成功，整改依据已整批切换到 v{{ campaign.to_version }}；旧版本分数与工单仍可在结果页按版本查看。
+          </p>
+          {% endif %}
+        </div>
+        {% endif %}
+        <div id="reeval-msg" class="alert alert-info" hidden style="margin-top:8px"></div>
+
+        <details class="help" style="margin-top:8px">
+          <summary>登记新规则版本（粘贴调整后的规则集 JSON）</summary>
+          <div class="field" style="margin-top:8px">
+            <label for="rules-note">版本说明</label>
+            <input type="text" id="rules-note" placeholder="例如：放宽重量缺失率至 20%、加严供应商缺失率">
+          </div>
+          <div class="field">
+            <label for="rules-json">规则集 JSON（version 必须未登记过）</label>
+            <textarea id="rules-json" placeholder='{"version": "2.0", "columns": {…}}'></textarea>
+          </div>
+          <button type="button" class="btn small secondary" id="rules-version-submit">登记并设为当前版本</button>
+          <p class="small muted" style="margin:6px 0 0">
+            登记后新抽检按新版本计分；历史批次用「批量重评」升级。可参考 <code>sample_data/rules_v2.json</code>。
+          </p>
+        </details>
+      </div>
+      <div class="panel-actions">
+        {% if campaign and campaign.status == 'failed' %}
+        <button type="button" id="reeval-resume" data-campaign="{{ campaign.campaign_id }}">从断点续跑（剩余 {{ campaign.total - campaign.done_count }} 批）</button>
+        {% endif %}
+        {% if can_create_reeval %}
+        <button type="button" id="reeval-start" class="{% if campaign and campaign.status == 'failed' %}secondary{% endif %}">发起批量重评（{{ eligible_count }} 批 → v{{ current_version }}）</button>
+        {% endif %}
+        {% if no_data_count %}<span class="small muted" style="align-self:center">另有 {{ no_data_count }} 个历史批次无原始数据快照，不可重评。</span>{% endif %}
+      </div>
+    </section>
+
     <section class="panel" id="m1">
       <div class="panel-head">
         <h2>列规则与权重（{{ column_specs|length }} 列）</h2>
@@ -246,7 +331,7 @@
       </div>
       <div class="table-wrap">
         <table class="dense">
-          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>状态</th><th>工单 CSV</th></tr></thead>
+          <thead><tr><th>运行</th><th>时间</th><th>数据源</th><th>行数</th><th>总分</th><th>分级</th><th>规则版本</th><th>重评状态</th><th>工单变化</th><th>状态</th><th>工单 CSV</th></tr></thead>
           <tbody>
             {% for item in history %}
             <tr>
@@ -256,18 +341,33 @@
               <td>{{ item.rows or '—' }}</td>
               <td>{% if item.total_score is not none %}{{ item.total_score|num(2) }}{% else %}—{% endif %}</td>
               <td>{% if item.grade %}<span class="tag {% if item.grade == 'A' %}ok{% elif item.grade == 'B' %}warn{% else %}err{% endif %}">{{ item.grade }}</span>{% else %}—{% endif %}</td>
+              <td class="small">
+                {% if item.basis %}
+                <span class="tag {% if item.is_current %}ok{% else %}warn{% endif %}">v{{ item.basis }}</span>
+                {% if item.rule_version and item.rule_version != item.basis %}<div class="small muted">原始 v{{ item.rule_version }}</div>{% endif %}
+                {% else %}—{% endif %}
+              </td>
+              <td class="small"><span class="tag {{ item.reeval_tone }}">{{ item.reeval_label }}</span></td>
+              <td class="small nowrap">
+                {% if item.alerts_before is not none and item.alerts_after is not none %}
+                  {{ item.alerts_before }} → {{ item.alerts_after }} 条
+                  {% if item.alerts_after < item.alerts_before %}<span class="tag ok">减</span>
+                  {% elif item.alerts_after > item.alerts_before %}<span class="tag err">增</span>
+                  {% else %}<span class="tag">持平</span>{% endif %}
+                {% else %}—{% endif %}
+              </td>
               <td class="small">{{ item.stage }}</td>
               <td class="small">{% if item.status == 'done' %}<a href="/api/runs/{{ item.run_id }}/alerts.csv">下载</a>{% else %}—{% endif %}</td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="muted">暂无记录。执行一次抽检后，这里会按时间倒序列出运行与工单下载入口。</td></tr>
+            <tr><td colspan="11" class="muted">暂无记录。执行一次抽检后，这里会按时间倒序列出运行与工单下载入口。</td></tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
       <div class="panel-actions">
         <span class="small muted" style="align-self:center">
-          整改工单 CSV 字段：工单号 / row_id / column / rules / severity / 当前值 / 问题说明 / 整改建议；缺失违规按前 20 行逐行 + 其余按列汇总。
+          规则版本 = 当前整改依据；工单变化 = 原始版本 → 依据版本的工单条数。整改工单 CSV 字段：工单号 / row_id / column / rules / severity / 当前值 / 问题说明 / 整改建议。
         </span>
       </div>
     </section>

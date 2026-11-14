@@ -18,6 +18,35 @@ class InputError(Exception):
 
 DEFAULT_MISSING_TOKENS = ("", "na", "n/a", "null", "none", "-", "—")
 
+KNOWN_RULES = frozenset(
+    {"missing", "type", "range", "outlier", "duplicate_key", "duplicate_row"}
+)
+
+
+def validate_rules_structure(rules: dict) -> None:
+    """登记新规则版本前的最小结构校验；不合法 → InputError（路由层转 400）。"""
+    if not isinstance(rules, dict):
+        raise InputError("规则集必须是 JSON 对象。")
+    version = str(rules.get("version") or "").strip()
+    if not version:
+        raise InputError("规则集缺少 version 字段（版本号必填，且不能与已登记版本重复）。")
+    columns = rules.get("columns")
+    if not isinstance(columns, dict) or not columns:
+        raise InputError("规则集缺少 columns 定义（至少声明一列）。")
+    for name, spec in columns.items():
+        if not isinstance(spec, dict):
+            raise InputError(f"列 {name} 的定义必须是对象。")
+        unknown = [r for r in (spec.get("rules") or []) if r not in KNOWN_RULES]
+        if unknown:
+            raise InputError(
+                f"列 {name} 启用了未知规则：{'、'.join(unknown)}；"
+                f"可用规则有 {'、'.join(sorted(KNOWN_RULES))}"
+            )
+    business_key = rules.get("business_key") or []
+    dangling = [c for c in business_key if c not in columns]
+    if dangling:
+        raise InputError(f"business_key 引用了未定义的列：{'、'.join(dangling)}。")
+
 
 def decode_bytes(raw: bytes) -> tuple[str, str]:
     """UTF-8-SIG / UTF-8 / GB18030 依次尝试，返回 (文本, 编码说明)。"""

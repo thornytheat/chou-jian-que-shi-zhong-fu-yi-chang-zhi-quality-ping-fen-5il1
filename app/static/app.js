@@ -206,6 +206,106 @@
     });
   }
 
+  // ---------- 工作台：规则版本与批量重评 ----------
+  (function reevalPanel() {
+    var panel = qs('#reeval');
+    if (!panel) return;
+    var msgBox = qs('#reeval-msg');
+    var bar = qs('#reeval-progress-bar');
+    var text = qs('#reeval-progress-text');
+
+    function msg(message, cls) {
+      if (!msgBox) return;
+      msgBox.hidden = false;
+      msgBox.className = 'alert ' + (cls || 'alert-info');
+      msgBox.innerHTML = message;
+    }
+
+    async function pollCampaign(campaignId) {
+      for (var i = 0; i < 600; i++) {
+        try {
+          var c = await fetch('/api/reevals/' + campaignId).then(readJSON);
+          if (bar && c.total) bar.style.width = Math.round((c.done_count / c.total) * 100) + '%';
+          if (text) text.textContent = '进度 ' + c.done_count + '/' + c.total;
+          if (c.status === 'done') {
+            msg('重评全部完成：' + c.total + ' 批已整批切换到 v' + c.to_version +
+              '，整改依据已更新。正在刷新…');
+            window.setTimeout(function () { window.location.reload(); }, 900);
+            return;
+          }
+          if (c.status === 'failed') {
+            msg('重评中断：' + (c.error || '未知错误') + '。已完成的批次保留记录，' +
+              '所有批次仍按旧版本作为整改依据。正在刷新…', 'alert-error');
+            window.setTimeout(function () { window.location.reload(); }, 1200);
+            return;
+          }
+        } catch (e) { /* 网络抖动时继续轮询 */ }
+        await new Promise(function (r) { setTimeout(r, 800); });
+      }
+    }
+
+    var startBtn = qs('#reeval-start');
+    if (startBtn) {
+      startBtn.addEventListener('click', function () {
+        startBtn.disabled = true;
+        window.postJSON('/api/reevals', {})
+          .then(function (c) {
+            msg('重评批次 ' + c.campaign_id + ' 已启动：' + c.total + ' 批 → v' + c.to_version + '。');
+            pollCampaign(c.campaign_id);
+          })
+          .catch(function (err) {
+            startBtn.disabled = false;
+            msg('发起失败：' + err.message, 'alert-error');
+          });
+      });
+    }
+
+    var resumeBtn = qs('#reeval-resume');
+    if (resumeBtn) {
+      resumeBtn.addEventListener('click', function () {
+        resumeBtn.disabled = true;
+        var id = resumeBtn.getAttribute('data-campaign');
+        window.postJSON('/api/reevals/' + id + '/resume', {})
+          .then(function () {
+            msg('已从断点续跑：已完成的批次跳过，同一批重试不会新增重复记录。');
+            pollCampaign(id);
+          })
+          .catch(function (err) {
+            resumeBtn.disabled = false;
+            msg('续跑失败：' + err.message, 'alert-error');
+          });
+      });
+    }
+
+    var submitBtn = qs('#rules-version-submit');
+    if (submitBtn) {
+      submitBtn.addEventListener('click', function () {
+        var area = qs('#rules-json');
+        var note = qs('#rules-note');
+        var content = area ? area.value.trim() : '';
+        if (!content) { msg('请先粘贴规则集 JSON（version 必须未登记过）。', 'alert-error'); return; }
+        var parsed;
+        try { parsed = JSON.parse(content); }
+        catch (e) { msg('JSON 解析失败：' + e.message, 'alert-error'); return; }
+        submitBtn.disabled = true;
+        window.postJSON('/api/rules/versions', { rules: parsed, note: note ? note.value : '' })
+          .then(function (data) {
+            msg('规则版本 v' + data.version + ' 已登记并设为当前版本；' + data.eligible +
+              ' 个历史批次可发起批量重评。正在刷新…');
+            window.setTimeout(function () { window.location.reload(); }, 900);
+          })
+          .catch(function (err) {
+            submitBtn.disabled = false;
+            msg('登记失败：' + err.message, 'alert-error');
+          });
+      });
+    }
+
+    // 页面打开时若有进行中的批次，直接接着轮询
+    var runningId = panel.getAttribute('data-running');
+    if (runningId) pollCampaign(runningId);
+  })();
+
   // ---------- 复核页：历史运行搜索 / 统计 / 导出清单（纯前端增强，服务端查询不变） ----------
   (function reviewTools() {
     var table = qs('#history-table');

@@ -2,14 +2,14 @@
 {% block title %}抽检结果 {{ run.run_id }} · {{ app_name }}{% endblock %}
 {% block crumb %}抽检结果{% endblock %}
 {% block meta %}<span class="dot {% if score.total >= score.thresholds.B %}ok{% else %}warn{% endif %}"></span>
-总分 {{ score.total|num(2) }} · 分级 {{ score.grade }} · {{ report.dataset.rows }} 行{% endblock %}
+总分 {{ score.total|num(2) }} · 分级 {{ score.grade }} · {{ report.dataset.rows }} 行 · v{{ viewing }}{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">再抽检一次</a>
 <a class="btn secondary small" href="/review">去复核页改权重</a>
-<a class="btn small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载工单 CSV</a>
+<a class="btn small" href="/api/runs/{{ run.run_id }}/alerts.csv?version={{ viewing }}">下载工单 CSV</a>
 {% endblock %}
 {% block status_left %}规则集 v{{ report.dataset.rule_version }} · 业务键 {{ report.dataset.business_key|join(' + ') }} · 耗时 {{ report.elapsed_ms|num(1) }} ms · 同一输入可复现{% endblock %}
-{% block status_right %}run_id <code>{{ run.run_id }}</code>{% endblock %}
+{% block status_right %}run_id <code>{{ run.run_id }}</code> · 查看版本 v{{ viewing }}{% endblock %}
 
 {% block content %}
 <div class="page-head">
@@ -19,6 +19,7 @@
       数据源 {{ report.dataset.source }} · 编码 {{ report.dataset.encoding }} ·
       {{ report.dataset.rows }} 行 × {{ report.dataset.columns }} 列 · 规则集 v{{ report.dataset.rule_version }} ·
       业务键 {{ report.dataset.business_key|join(' + ') }} · 执行于 {{ run.created_at }} · 耗时 {{ report.elapsed_ms|num(1) }} ms
+      {% if report.reeval %}<br>本报告为重评记录：批次 <code>{{ report.reeval.campaign_id }}</code> 按 v{{ report.reeval.to_version }} 重新评分（原依据 v{{ report.reeval.from_version }}）。{% endif %}
       <br>
       加权总分 <strong>{{ score.total|num(2) }}</strong>（分级
       <span class="tag {% if score.grade == 'A' %}ok{% elif score.grade == 'B' %}warn{% else %}err{% endif %}">{{ score.grade }}</span>，
@@ -27,6 +28,54 @@
     </p>
   </div>
 </div>
+
+{% if viewing != basis %}
+<div class="alert alert-error" role="alert">
+  正在查看历史版本 <strong>v{{ viewing }}</strong> 的报告；当前整改依据是 <strong>v{{ basis }}</strong>。
+  换发工单请用依据版本，避免新旧口径混用。
+  <a href="/result/{{ run.run_id }}">打开依据版本</a>
+</div>
+{% endif %}
+
+{% if versions|length > 1 %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>规则版本与整改依据</h2>
+    <div class="panel-actions">
+      <span class="tag {% if viewing == basis %}ok{% else %}warn{% endif %}">查看 v{{ viewing }}{% if viewing == basis %} · 整改依据{% endif %}</span>
+    </div>
+  </div>
+  <div class="table-wrap auto">
+    <table class="dense">
+      <thead><tr><th>规则版本</th><th>来源</th><th>总分</th><th>分级</th><th>工单数</th><th>标记</th><th>查看 / 工单</th></tr></thead>
+      <tbody>
+        {% for v in versions %}
+        <tr>
+          <td><code>v{{ v.version }}</code></td>
+          <td class="small">{% if v.kind == 'original' %}原始评分{% else %}重评批次 <code>{{ v.campaign_id }}</code>{% endif %}</td>
+          <td>{% if v.score is not none %}{{ v.score|num(2) }}{% else %}—{% endif %}</td>
+          <td>{% if v.grade %}<span class="tag {% if v.grade == 'A' %}ok{% elif v.grade == 'B' %}warn{% else %}err{% endif %}">{{ v.grade }}</span>{% else %}—{% endif %}</td>
+          <td>{{ v.alerts_total if v.alerts_total is not none else '—' }}</td>
+          <td>
+            {% if v.is_basis %}<span class="tag ok">整改依据</span>{% endif %}
+            {% if v.version == viewing %}<span class="tag">查看中</span>{% endif %}
+          </td>
+          <td class="small nowrap">
+            {% if v.version != viewing %}<a href="/result/{{ run.run_id }}?version={{ v.version }}">打开</a>{% else %}本页{% endif %}
+            · <a href="/api/runs/{{ run.run_id }}/alerts.csv?version={{ v.version }}">工单 CSV</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-actions">
+    <span class="small muted" style="align-self:center">
+      每个规则版本的分数与工单独立保存、始终可查；整改依据只有在批量重评全部成功后才会整批切换。
+    </span>
+  </div>
+</section>
+{% endif %}
 
 <div class="kpi-strip">
   <div class="kpi {% if score.grade in ['A','B'] %}ok{% else %}err{% endif %}">
@@ -66,7 +115,7 @@
     </div>
     <div class="panel-actions">
       <span class="tag">{{ alerts_total }} 条告警</span>
-      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载工单 CSV</a>
+      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/alerts.csv?version={{ viewing }}">下载工单 CSV</a>
     </div>
   </div>
 
@@ -261,7 +310,7 @@
       <h3 style="margin:0 0 4px">告警与整改（同一 (row_id, column) 只出现一条，rules[] 为全部命中规则）</h3>
       <p class="small muted" style="margin:0 0 8px">
         共 {{ alerts_total }} 条，当前页面渲染前 {{ alerts_shown }} 条（按 severity 排序，表头在容器内吸顶）。
-        <a href="/api/runs/{{ run.run_id }}/alerts.csv">下载完整工单 CSV</a>（含全部 {{ alerts_total }} 条，可直接下发上游）。
+        <a href="/api/runs/{{ run.run_id }}/alerts.csv?version={{ viewing }}">下载完整工单 CSV</a>（含全部 {{ alerts_total }} 条，可直接下发上游）。
       </p>
     </div>
     <div class="table-wrap roomy">
@@ -289,7 +338,7 @@
       <span class="small muted" style="align-self:center">
         缺失违规按「前 20 行逐行 + 其余按列汇总」输出，避免同一列的数百行缺失把工单撑爆；列级汇总在缺失明细表中是完整计数。
       </span>
-      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/alerts.csv">下载完整工单 CSV</a>
+      <a class="btn secondary small" href="/api/runs/{{ run.run_id }}/alerts.csv?version={{ viewing }}">下载完整工单 CSV</a>
     </div>
   </div>
 </div>

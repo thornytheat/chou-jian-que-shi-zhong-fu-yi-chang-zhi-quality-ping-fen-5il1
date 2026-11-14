@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import export, loader, pipeline, score, seed, settings, store
+from . import export, loader, pipeline, reeval, score, seed, settings, store
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -40,9 +40,14 @@ _LOCK = threading.Lock()
 
 
 def rules() -> dict:
+    """当前生效的规则集：以规则版本注册表为准，未注册过时回退到 rules.json 文件。"""
     if _STATE["rules"] is None:
-        _STATE["rules"] = loader.load_rules()
+        _STATE["rules"] = store.current_rules() or loader.load_rules()
     return _STATE["rules"]
+
+
+def reload_rules() -> None:
+    _STATE["rules"] = None
 
 
 def ensure_seeded() -> None:
@@ -51,6 +56,8 @@ def ensure_seeded() -> None:
     with _LOCK:
         if _STATE["seeded"]:
             return
+        store.ensure_rule_version(loader.load_rules())
+        store.interrupt_running_campaigns()
         seed.ensure_seed()
         _STATE["seeded"] = True
 
@@ -105,6 +112,7 @@ def index(request: Request):
         "latest": latest,
         "latest_report": latest_report,
         "stats": stats,
+        "current_version": str(r.get("version")),
         "business_key": r.get("business_key"),
         "rule_weights": r.get("rule_weights", {}),
         "rule_labels": score.RULE_LABELS,
@@ -119,7 +127,25 @@ def index(request: Request):
 def workbench(request: Request):
     ensure_seeded()
     r = rules()
+    current_version = str(r.get("version"))
     history = store.list_runs(limit=5)
+    campaign = store.latest_campaign()
+    record_map = {}
+    if campaign:
+        record_map = {rec["run_id"]: rec
+                      for rec in store.campaign_records(campaign["campaign_id"])}
+    enriched = []
+    for item in history:
+        full = store.get_run(item["run_id"]) if item["status"] == "done" else None
+        enriched.append(_history_row(item, current_version,
+                                     record_map.get(item["run_id"]), full))
+    eligible = store.eligible_runs(current_version)
+    can_create = bool(eligible) and not (
+        campaign and campaign["status"] == "running"
+    ) and not (
+        campaign and campaign["status"] == "failed"
+        and campaign["to_version"] == current_version
+    )
     return templates.TemplateResponse(request, "workbench.html", {
         "app_name": settings.APP_NAME,
         "page": "workbench",
@@ -134,14 +160,54 @@ def workbench(request: Request):
         "min_group_sample": r.get("min_group_sample"),
         "thresholds": r.get("grade_thresholds"),
         "sample_rows": 2000,
-        "history": history,
+        "history": enriched,
         "latest": history[0] if history else None,
         "stages": [label for _, label in pipeline.STAGES],
+        "current_version": current_version,
+        "rule_versions": store.list_rule_versions(),
+        "campaign": campaign,
+        "eligible_count": len(eligible),
+        "no_data_count": store.runs_without_data(current_version),
+        "can_create_reeval": can_create,
     })
 
 
+def _history_row(item: dict, current_version: str,
+                 record: dict | None, full: dict | None) -> dict:
+    """工作台历史行：依据版本、重评状态、工单变化（旧 → 新）。"""
+    row = dict(item)
+    basis = item.get("basis_version") or item.get("rule_version")
+    scored = item.get("rule_version")
+    row["basis"] = basis
+    row["is_current"] = bool(basis) and basis == current_version
+    alerts_before = alerts_after = None
+    if full and full.get("report"):
+        alerts_before = ((full["report"].get("alerts") or {}).get("total"))
+    if basis and scored and basis != scored:
+        done = store.latest_done_record(item["run_id"], basis)
+        if done:
+            alerts_after = done.get("alerts_total")
+    row["alerts_before"] = alerts_before
+    row["alerts_after"] = alerts_after
+    if record and record["status"] == "done":
+        if basis == record["rule_version"]:
+            row["reeval_label"], row["reeval_tone"] = "已切换", "ok"
+        else:
+            row["reeval_label"], row["reeval_tone"] = "已重评·待整批切换", "warn"
+    elif record and record["status"] == "failed":
+        row["reeval_label"], row["reeval_tone"] = "重评失败·待续跑", "err"
+    elif record:
+        row["reeval_label"], row["reeval_tone"] = "重评中", "warn"
+    elif basis and basis != current_version:
+        row["reeval_label"], row["reeval_tone"] = "待重评", "warn"
+    else:
+        row["reeval_label"], row["reeval_tone"] = "当前版本", "ok"
+    return row
+
+
 @app.get("/result/{run_id}", response_class=HTMLResponse)
-def result(request: Request, run_id: str, limit: int = ALERT_PAGE_LIMIT):
+def result(request: Request, run_id: str, version: str | None = None,
+           limit: int = ALERT_PAGE_LIMIT):
     ensure_seeded()
     run = store.get_run(run_id)
     if run is None:
@@ -154,7 +220,13 @@ def result(request: Request, run_id: str, limit: int = ALERT_PAGE_LIMIT):
         })
     if run["status"] == "failed":
         raise HTTPException(status_code=409, detail=f"该次运行失败：{run.get('error') or '未知错误'}")
-    report = run["report"]
+    report, kind, viewing = reeval.resolve_report(run, version)
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"批次 {run_id} 没有规则版本 v{viewing} 的重评记录（或该版本重评未成功）。",
+        )
+    basis = reeval.basis_version(run)
     total_alerts = report["alerts"]["total"]
     limit = max(10, min(500, limit))
     return templates.TemplateResponse(request, "result.html", {
@@ -171,6 +243,10 @@ def result(request: Request, run_id: str, limit: int = ALERT_PAGE_LIMIT):
         "insufficient": report["outliers"]["insufficient"],
         "rule_labels": score.RULE_LABELS,
         "severity_labels": {"high": "高", "medium": "中", "low": "低"},
+        "versions": reeval.available_versions(run),
+        "viewing": viewing,
+        "viewing_kind": kind,
+        "basis": basis,
     })
 
 
@@ -188,6 +264,7 @@ def review(request: Request):
         "rules": r,
         "history": history,
         "recent": recent,
+        "current_version": str(r.get("version")),
         "columns": [
             {"name": n, "label": s.get("label", n), "default": float(s.get("weight", 1.0)),
              "value": columns[n]}
@@ -211,8 +288,10 @@ def _start_run(source: str, data: dict) -> dict:
     r = rules()
     overrides = store.weight_overrides()
     run_id = uuid.uuid4().hex[:12]
-    store.create_run(run_id, source, overrides)
     rows, columns = data["rows"], data["columns"]
+    store.create_run(run_id, source, overrides,
+                     data={"columns": columns, "rows": rows},
+                     rule_version=r.get("version"))
 
     def worker() -> None:
         try:
@@ -303,14 +382,20 @@ def run_status(run_id: str) -> dict:
 
 
 @app.get("/api/runs/{run_id}/alerts.csv", response_class=PlainTextResponse)
-def alerts_csv(run_id: str):
+def alerts_csv(run_id: str, version: str | None = None):
     run = store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
     if run["status"] != "done" or not run.get("report"):
         raise HTTPException(status_code=409, detail="该次运行尚未完成，暂不能导出工单。")
-    csv_text = export.alerts_to_csv(run["report"]["alerts"])
-    filename = f"qualiscan-workorder-{run_id}.csv"
+    report, _, viewing = reeval.resolve_report(run, version)
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"批次 {run_id} 没有规则版本 v{viewing} 的重评记录（或该版本重评未成功）。",
+        )
+    csv_text = export.alerts_to_csv(report["alerts"])
+    filename = f"qualiscan-workorder-{run_id}-v{viewing}.csv"
     return PlainTextResponse(
         csv_text,
         media_type="text/csv; charset=utf-8",
@@ -371,6 +456,117 @@ def reset_weights() -> dict:
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- 规则版本与批量重评
+
+
+@app.get("/api/rules/versions")
+def rule_versions_api() -> dict:
+    ensure_seeded()
+    return {
+        "current": store.current_rule_version(),
+        "versions": store.list_rule_versions(),
+    }
+
+
+@app.post("/api/rules/versions")
+def register_rule_version(payload: dict) -> dict:
+    """登记新规则版本并设为当前版本；历史批次分数不变，等批量重评升级。"""
+    ensure_seeded()
+    payload = payload or {}
+    content = payload.get("rules")
+    note = str(payload.get("note") or "").strip()
+    try:
+        loader.validate_rules_structure(content)
+    except loader.InputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    version = str(content["version"]).strip()
+    if store.get_rule_version(version) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"规则版本 v{version} 已登记过；如需再次调整请递增版本号。",
+        )
+    store.register_rule_version(version, content, note)
+    reload_rules()
+    return {"ok": True, "version": version, "current": version,
+            "eligible": len(store.eligible_runs(version))}
+
+
+@app.get("/api/reevals")
+def reevals_api() -> dict:
+    ensure_seeded()
+    return {"campaigns": store.list_campaigns(limit=10)}
+
+
+@app.post("/api/reevals")
+def create_reeval() -> dict:
+    """发起批量重评：把所有仍停在旧规则版本的批次，按当前规则版本生成独立重评记录。"""
+    ensure_seeded()
+    current = str(rules().get("version"))
+    running = store.active_campaign()
+    if running and running["status"] == "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"重评批次 {running['campaign_id']} 正在进行中，请等待完成或失败后续跑。",
+        )
+    existing = store.active_campaign(to_version=current)
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"已存在目标 v{current} 的重评批次 {existing['campaign_id']}"
+                   f"（{existing['status']}）；同一批请断点续跑，不要重复建批。",
+        )
+    scope = store.eligible_runs(current)
+    if not scope:
+        raise HTTPException(
+            status_code=400,
+            detail=f"所有已完成批次都已是当前规则版本 v{current}（或缺原始数据快照不可重评），无需重评。",
+        )
+    campaign_id = "rc-" + uuid.uuid4().hex[:10]
+    store.create_campaign(campaign_id, current, scope, store.basis_versions_of(scope))
+    reeval.start_campaign_thread(campaign_id)
+    return {"campaign_id": campaign_id, "status": "running",
+            "to_version": current, "total": len(scope)}
+
+
+@app.get("/api/reevals/{campaign_id}")
+def reeval_detail(campaign_id: str) -> dict:
+    campaign = store.get_campaign(campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail=f"重评批次 {campaign_id} 不存在。")
+    records = store.campaign_records(campaign_id)
+    return {**campaign, "remaining": campaign["total"] - campaign["done_count"],
+            "records": records}
+
+
+@app.post("/api/reevals/{campaign_id}/resume")
+def resume_reeval(campaign_id: str) -> dict:
+    """断点续跑：从失败处继续，已完成的批次跳过，同一批重试不新增重复记录。"""
+    campaign = store.get_campaign(campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail=f"重评批次 {campaign_id} 不存在。")
+    if campaign["status"] == "done":
+        raise HTTPException(status_code=409, detail="该重评批次已完成，无需续跑。")
+    if not store.resume_campaign(campaign_id):
+        raise HTTPException(status_code=409, detail="该重评批次正在运行中，无需重复触发。")
+    reeval.start_campaign_thread(campaign_id)
+    return {"campaign_id": campaign_id, "status": "running",
+            "remaining": campaign["total"] - campaign["done_count"]}
+
+
+@app.get("/api/runs/{run_id}/versions")
+def run_versions_api(run_id: str) -> dict:
+    """某批次已评出的全部规则版本（原始 + 各次重评），旧分数与旧工单都可查。"""
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"运行记录 {run_id} 不存在。")
+    return {
+        "run_id": run_id,
+        "original": reeval.original_version(run),
+        "basis": reeval.basis_version(run),
+        "versions": reeval.available_versions(run),
+    }
+
+
 @app.post("/api/runs/{run_id}/rescore")
 def rescore(run_id: str) -> dict:
     run = store.get_run(run_id)
@@ -380,13 +576,18 @@ def rescore(run_id: str) -> dict:
         raise HTTPException(status_code=409, detail="该次运行尚未完成，无法重算。")
     r = rules()
     overrides = store.weight_overrides()
-    report = run["report"]
+    # 重算作用于当前依据版本的报告：原始报告或切换后的重评记录
+    report, kind, viewing = reeval.resolve_report(run)
     units = score.build_units(report["missing"], report["duplicates"],
                               report["outliers"], report["validation"], r)
     report["score"] = score.compute(units, r, overrides)
-    store.update_report(run_id, report, overrides)
+    if kind == "reeval":
+        store.update_reeval_report(run_id, viewing, report, overrides)
+    else:
+        store.update_report(run_id, report, overrides)
     return {
         "run_id": run_id,
+        "version": viewing,
         "total": report["score"]["total"],
         "grade": report["score"]["grade"],
         "weights": report["score"]["weights_used"],
